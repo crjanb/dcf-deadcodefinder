@@ -2,7 +2,7 @@
   "name": "dcf-deadcodefinder",
   "displayName": "DCF - DeadCodeFinder",
   "description": "Dead code Finder - \"Find code that exists… but serves no purpose.\"",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "publisher": "crjanb",
   "engines": {
     "vscode": "^1.108.0"
