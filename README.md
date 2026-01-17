@@ -21,8 +21,8 @@ vsce package
 
 ## Features
 
-### Unused Functions
+### Find in vscode extension marketplace
 ![Unused Functions](/assets/img1.png)
 
-### Commented Code
+### Example of unused function
 ![Commented Code](/assets/img2.png)
