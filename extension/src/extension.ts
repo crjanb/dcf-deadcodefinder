@@ -3,6 +3,20 @@ import { execFile } from 'child_process';
 import * as path from 'path';
 import * as fs from 'fs';
 
+/* ---------------- TYPES ---------------- */
+
+type FunctionInfo = {
+    name: string;
+    file: string;
+    line: number;
+    usageCount: number;
+    lastUsed?: { file: string; line: number };
+};
+
+const functionIndex = new Map<string, FunctionInfo>();
+
+/* ---------------- ACTIVATE ---------------- */
+
 export function activate(context: vscode.ExtensionContext) {
     console.log('DCF extension activated');
 
@@ -11,46 +25,82 @@ export function activate(context: vscode.ExtensionContext) {
 
     let analysisResult: any = null;
     let analyzerTimeout: NodeJS.Timeout | null = null;
-    const DEBOUNCE_DELAY = 500; // 500ms delay after last save
+    const DEBOUNCE_DELAY = 500;
 
-    // --- Single CodeLens provider ---
+    /* ---------------- CODELENS ---------------- */
+
     class DeadCodeCodeLensProvider implements vscode.CodeLensProvider {
-        private _onDidChangeCodeLenses: vscode.EventEmitter<void> = new vscode.EventEmitter<void>();
-        public readonly onDidChangeCodeLenses: vscode.Event<void> = this._onDidChangeCodeLenses.event;
+        private _onDidChange = new vscode.EventEmitter<void>();
+        readonly onDidChangeCodeLenses = this._onDidChange.event;
 
-        public refresh() {
-            this._onDidChangeCodeLenses.fire();
+        refresh() {
+            this._onDidChange.fire();
         }
 
         provideCodeLenses(document: vscode.TextDocument): vscode.CodeLens[] {
             if (!analysisResult) return [];
 
-            const codeLenses: vscode.CodeLens[] = [];
-            const functionsInFile = analysisResult.unused_functions.filter((f: any) => f.file === document.uri.fsPath);
+            const lenses: vscode.CodeLens[] = [];
 
-            for (const func of functionsInFile) {
-                if (func.usage_count === 0) {
-                    const range = new vscode.Range(func.line - 1, 0, func.line - 1, 0);
-                    const title = `Unused function`;
-                    codeLenses.push(new vscode.CodeLens(range, { title, command: "", arguments: [] }));
+            for (const fn of analysisResult.functions) {
+                if (fn.file === document.uri.fsPath && fn.usage_count === 0) {
+                    const range = new vscode.Range(fn.line - 1, 0, fn.line - 1, 0);
+                    lenses.push(new vscode.CodeLens(range, {
+                        title: 'Unused function',
+                        command: ''
+                    }));
                 }
             }
-
-            return codeLenses;
+            return lenses;
         }
     }
 
     const codeLensProvider = new DeadCodeCodeLensProvider();
     context.subscriptions.push(
-        vscode.languages.registerCodeLensProvider({ scheme: 'file', language: 'python' }, codeLensProvider)
+        vscode.languages.registerCodeLensProvider({ language: 'python', scheme: 'file' }, codeLensProvider)
     );
 
-    // --- Analyzer function ---
-    const runAnalyzer = () => {
-        const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
-        if (!workspaceFolder) return;
+    /* ---------------- HOVER PROVIDER ---------------- */
 
-        const pythonExecutable = 'python';
+    context.subscriptions.push(
+        vscode.languages.registerHoverProvider('python', {
+            provideHover(document, position) {
+                const range = document.getWordRangeAtPosition(position);
+                if (!range) return;
+
+                const word = document.getText(range);
+                const key = `${document.uri.fsPath}:${position.line + 1}`;
+                const info = functionIndex.get(key);
+
+                if (!info || info.name !== word) return;
+
+                const md = new vscode.MarkdownString();
+                md.isTrusted = true;
+
+                if (info.usageCount === 0) {
+                    md.appendMarkdown(`### 🚫 Unused function\n`);
+                    md.appendMarkdown(`Defined in **${path.basename(info.file)}:${info.line}**\n\n`);
+                    md.appendMarkdown(`Used: **0 times**`);
+                } else {
+                    md.appendMarkdown(`### ✅ Function used ${info.usageCount} times\n`);
+                    md.appendMarkdown(`Defined in **${path.basename(info.file)}:${info.line}**\n\n`);
+                    if (info.lastUsed) {
+                        md.appendMarkdown(
+                            `Last used in **${path.basename(info.lastUsed.file)}:${info.lastUsed.line}**`
+                        );
+                    }
+                }
+
+                return new vscode.Hover(md);
+            }
+        })
+    );
+
+    /* ---------------- ANALYZER ---------------- */
+
+    const runAnalyzer = () => {
+        const workspace = vscode.workspace.workspaceFolders?.[0];
+        if (!workspace) return;
 
         const analyzerCandidates = [
             path.join(context.extensionPath, 'cli.py'),
@@ -59,74 +109,74 @@ export function activate(context: vscode.ExtensionContext) {
         ];
 
         const analyzerPath = analyzerCandidates.find(p => fs.existsSync(p));
-        if (!analyzerPath) {
-            console.error('Analyzer script not found. Searched:', analyzerCandidates);
-            return;
-        }
+        if (!analyzerPath) return;
 
-        console.log('Running analyzer at:', analyzerPath);
+        execFile('python', [analyzerPath, workspace.uri.fsPath], { timeout: 30000 }, (err, stdout) => {
+            if (err) return;
 
-        execFile(pythonExecutable, [analyzerPath, workspaceFolder.uri.fsPath], { timeout: 30000 }, (error, stdout, stderr) => {
-            console.log('Analyzer output:', { error, stdout, stderr });
+            try {
+                analysisResult = JSON.parse(stdout);
+            } catch {
+                return;
+            }
 
-            if (error) return;
+            /* ---- rebuild index ---- */
+            functionIndex.clear();
+            for (const fn of analysisResult.functions) {
+                functionIndex.set(`${fn.file}:${fn.line}`, {
+                    name: fn.name,
+                    file: fn.file,
+                    line: fn.line,
+                    usageCount: fn.usage_count,
+                    lastUsed: fn.last_used || undefined
+                });
+            }
 
-            try { analysisResult = JSON.parse(stdout); } catch { return; }
-
-            console.log('Analysis result:', analysisResult);
-
-            // --- Clear old diagnostics ---
+            /* ---- diagnostics ---- */
             diagnosticCollection.clear();
-            const fileDiagnosticsMap: Map<string, vscode.Diagnostic[]> = new Map();
+            const fileMap = new Map<string, vscode.Diagnostic[]>();
 
-            // --- Unused functions ---
-            analysisResult.unused_functions.forEach((func: any) => {
-                if (func.usage_count === 0) {
-                    const range = new vscode.Range(func.line - 1, 0, func.line - 1, 100);
-                    const message = `Unused function`;
-                    const severity = vscode.DiagnosticSeverity.Warning;
-
-                    const diagnostic = new vscode.Diagnostic(range, message, severity);
-                    const uri = vscode.Uri.file(func.file);
-                    const arr = fileDiagnosticsMap.get(uri.fsPath) || [];
-                    arr.push(diagnostic);
-                    fileDiagnosticsMap.set(uri.fsPath, arr);
+            for (const fn of analysisResult.functions) {
+                if (fn.usage_count === 0) {
+                    const diag = new vscode.Diagnostic(
+                        new vscode.Range(fn.line - 1, 0, fn.line - 1, 100),
+                        'Unused function',
+                        vscode.DiagnosticSeverity.Warning
+                    );
+                    const arr = fileMap.get(fn.file) || [];
+                    arr.push(diag);
+                    fileMap.set(fn.file, arr);
                 }
-            });
+            }
 
-            // --- Commented code ---
-            analysisResult.commented_code.forEach((code: any) => {
-                const range = new vscode.Range(code.line - 1, 0, code.line - 1, 100);
-                const diagnostic = new vscode.Diagnostic(range, `Commented-out code: ${code.content}`, vscode.DiagnosticSeverity.Hint);
-                const uri = vscode.Uri.file(code.file);
-                const arr = fileDiagnosticsMap.get(uri.fsPath) || [];
-                arr.push(diagnostic);
-                fileDiagnosticsMap.set(uri.fsPath, arr);
-            });
+            for (const c of analysisResult.commented_code) {
+                const diag = new vscode.Diagnostic(
+                    new vscode.Range(c.line - 1, 0, c.line - 1, 100),
+                    `Commented-out code`,
+                    vscode.DiagnosticSeverity.Hint
+                );
+                const arr = fileMap.get(c.file) || [];
+                arr.push(diag);
+                fileMap.set(c.file, arr);
+            }
 
-            // --- Update diagnostics ---
-            fileDiagnosticsMap.forEach((diags, file) => {
+            fileMap.forEach((diags, file) => {
                 diagnosticCollection.set(vscode.Uri.file(file), diags);
             });
 
-            // --- Refresh CodeLens ---
             codeLensProvider.refresh();
         });
     };
 
-    // --- Command to manually scan workspace ---
-    const disposable = vscode.commands.registerCommand('dcf.scanWorkspace', runAnalyzer);
-    context.subscriptions.push(disposable);
+    context.subscriptions.push(
+        vscode.commands.registerCommand('dcf.scanWorkspace', runAnalyzer)
+    );
 
-    // --- Auto-run analyzer on save with debounce ---
     vscode.workspace.onDidSaveTextDocument(() => {
         if (analyzerTimeout) clearTimeout(analyzerTimeout);
-        analyzerTimeout = setTimeout(() => {
-            runAnalyzer();
-        }, DEBOUNCE_DELAY);
+        analyzerTimeout = setTimeout(runAnalyzer, DEBOUNCE_DELAY);
     });
 
-    // --- Initial scan on activation ---
     runAnalyzer();
 }
 
